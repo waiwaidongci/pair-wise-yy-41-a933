@@ -65,6 +65,38 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL
+                        CHECK(category IN ('sensor_peak','inspection_defect','vehicle_load','weather')),
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','closed')),
+                    review_count INTEGER NOT NULL DEFAULT 0,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    level TEXT NOT NULL
+                        CHECK(level IN ('observe','limit_load','restrict','close')),
+                    computed_level TEXT NOT NULL,
+                    triggers TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','disputed','effective','released','superseded')),
+                    engineer_level TEXT, engineer_by TEXT, engineer_at TEXT,
+                    authority_level TEXT, authority_by TEXT, authority_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, version)
+                );
             """)
 
     @staticmethod
@@ -156,6 +188,209 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def record_kind_count(self, item_id: int, kind: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND kind=?",
+                (item_id, kind),
+            ).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _reading(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        return item
+
+    def add_reading(self, item_id: int, category: str, payload: Dict[str, Any],
+                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO readings(item_id, category, payload, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, category, json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                     "open", external_ref, actor, now),
+                )
+                reading_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("登记数据唯一标识已存在") from exc
+        return self.get_reading(reading_id)
+
+    def get_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("登记数据不存在")
+        return self._reading(row)
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [self._reading(row) for row in rows]
+
+    def mark_reading_reviewed(self, reading_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE readings SET review_count=review_count+1, reviewed_by=?, reviewed_at=?
+                   WHERE id=?""",
+                (actor, now, reading_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("登记数据不存在")
+        return self.get_reading(reading_id)
+
+    def close_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE readings SET status='closed' WHERE id=? AND status='open'",
+                (reading_id,),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM readings WHERE id=?", (reading_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("登记数据不存在")
+                raise ConflictError("登记数据已关闭")
+        return self.get_reading(reading_id)
+
+    def open_defect_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM readings
+                   WHERE item_id=? AND category='inspection_defect' AND status='open'""",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def evaluation_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        """参评数据：传感/荷载/天气各取最新一条，缺陷取全部未关闭。"""
+        self.get_item(item_id)
+        with self._lock:
+            latest = self.conn.execute(
+                """SELECT r.* FROM readings r
+                   JOIN (SELECT category, MAX(id) AS mid FROM readings
+                         WHERE item_id=? AND category!='inspection_defect'
+                         GROUP BY category) t ON r.id=t.mid""",
+                (item_id,),
+            ).fetchall()
+            defects = self.conn.execute(
+                """SELECT * FROM readings
+                   WHERE item_id=? AND category='inspection_defect' AND status='open'
+                   ORDER BY id""",
+                (item_id,),
+            ).fetchall()
+        return [self._reading(row) for row in latest] + [self._reading(row) for row in defects]
+
+    @staticmethod
+    def _recommendation(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["triggers"] = json.loads(item["triggers"])
+        return item
+
+    def create_recommendation(self, item_id: int, level: str, triggers: List[Dict[str, Any]],
+                              actor: str) -> Dict[str, Any]:
+        """重算入口：旧版本全部失效留档，新版本待会签。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE recommendations SET status='superseded'
+                   WHERE item_id=? AND status!='superseded'""",
+                (item_id,),
+            )
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(version),0) AS v FROM recommendations WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            version = int(row["v"]) + 1
+            cur = self.conn.execute(
+                """INSERT INTO recommendations(item_id, version, level, computed_level, triggers,
+                   status, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, version, level, level,
+                 json.dumps(triggers, ensure_ascii=False, sort_keys=True),
+                 "pending", actor, now),
+            )
+            rec_id = int(cur.lastrowid)
+        return self.get_recommendation(rec_id)
+
+    def get_recommendation(self, rec_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("建议版本不存在")
+        return self._recommendation(row)
+
+    def list_recommendations(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM recommendations WHERE item_id=? ORDER BY version DESC",
+                (item_id,),
+            ).fetchall()
+        return [self._recommendation(row) for row in rows]
+
+    def current_recommendation(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM recommendations
+                   WHERE item_id=? AND status!='superseded'
+                   ORDER BY version DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return self._recommendation(row) if row else None
+
+    def sign_recommendation(self, rec_id: int, side: str, level: str,
+                            actor: str) -> Dict[str, Any]:
+        """会签：双方意见一致则生效，不一致则待决；失效或已发布版本拒绝签署。"""
+        if side not in ("engineer", "authority"):
+            raise ConflictError("未知会签方")
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("建议版本不存在")
+            if row["status"] not in ("pending", "disputed"):
+                raise ConflictError("当前版本不可会签")
+            self.conn.execute(
+                f"UPDATE recommendations SET {side}_level=?, {side}_by=?, {side}_at=? WHERE id=?",
+                (level, actor, now, rec_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+            engineer, authority = row["engineer_level"], row["authority_level"]
+            if engineer and authority:
+                if engineer == authority:
+                    self.conn.execute(
+                        "UPDATE recommendations SET status='effective', level=? WHERE id=?",
+                        (engineer, rec_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE recommendations SET status='disputed' WHERE id=?", (rec_id,))
+        return self.get_recommendation(rec_id)
+
+    def release_recommendation(self, rec_id: int) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE recommendations SET status='released' WHERE id=? AND status='effective'",
+                (rec_id,),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("建议版本不存在")
+                raise ConflictError("会签未一致，不能直接放行")
+        return self.get_recommendation(rec_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
