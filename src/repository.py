@@ -6,8 +6,9 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .advisory import ADVISORY_STATES, KINDS, LEVELS, READING_STATES
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 from .rules import ID_PREFIX, STATES
 
 
@@ -24,6 +25,10 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        kinds = ",".join("'" + k + "'" for k in KINDS)
+        levels = ",".join("'" + level + "'" for level in LEVELS)
+        reading_states = ",".join("'" + s + "'" for s in READING_STATES)
+        advisory_states = ",".join("'" + s + "'" for s in ADVISORY_STATES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -64,6 +69,46 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ({kinds})),
+                    payload TEXT NOT NULL,
+                    risk_level TEXT NOT NULL CHECK(risk_level IN ({levels})),
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ({reading_states})),
+                    defect_status TEXT CHECK(defect_status IN ('open','closed')),
+                    external_ref TEXT,
+                    review_note TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    closed_by TEXT,
+                    closed_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS advisories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    level TEXT NOT NULL CHECK(level IN ({levels})),
+                    triggers TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'signing'
+                        CHECK(status IN ({advisory_states})),
+                    note TEXT,
+                    eng_decision TEXT CHECK(eng_decision IN ('approve','reject')),
+                    eng_by TEXT,
+                    eng_comment TEXT,
+                    eng_at TEXT,
+                    road_decision TEXT CHECK(road_decision IN ('approve','reject')),
+                    road_by TEXT,
+                    road_comment TEXT,
+                    road_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, version)
                 );
             """)
 
@@ -156,6 +201,154 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _reading(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        return item
+
+    def add_reading(self, item_id: int, kind: str, payload: Dict[str, Any],
+                    risk_level: str, defect_status: Optional[str],
+                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO readings(item_id, kind, payload, risk_level, status,
+                       defect_status, external_ref, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (item_id, kind, json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                     risk_level, "active", defect_status, external_ref, actor, now),
+                )
+                reading_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("记录唯一标识已存在") from exc
+        return self.get_reading(item_id, reading_id)
+
+    def get_reading(self, item_id: int, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=? AND item_id=?",
+                (reading_id, item_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("数据不存在")
+        return self._reading(row)
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [self._reading(row) for row in rows]
+
+    def review_reading(self, reading_id: int, decision: str, note: Optional[str],
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        status = "reviewed" if decision == "confirm" else "void"
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE readings SET status=?, review_note=?, reviewed_by=?, reviewed_at=?
+                   WHERE id=?""",
+                (status, note, actor, now, reading_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        return self._reading(row)
+
+    def close_defect(self, reading_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE readings SET defect_status='closed', closed_by=?, closed_at=?
+                   WHERE id=?""",
+                (actor, now, reading_id),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        return self._reading(row)
+
+    def open_defect_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM readings
+                   WHERE item_id=? AND kind='inspection_defect'
+                     AND defect_status='open' AND status!='void'""",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _advisory(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["triggers"] = json.loads(item["triggers"])
+        return item
+
+    def latest_advisory(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM advisories WHERE item_id=?
+                   ORDER BY version DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return self._advisory(row) if row else None
+
+    def list_advisories(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM advisories WHERE item_id=? ORDER BY version DESC",
+                (item_id,),
+            ).fetchall()
+        return [self._advisory(row) for row in rows]
+
+    def create_advisory(self, item_id: int, version: int, level: str,
+                        triggers: List[Dict[str, Any]], status: str,
+                        note: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO advisories(item_id, version, level, triggers, status,
+                       note, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, version, level,
+                     json.dumps(triggers, ensure_ascii=False, sort_keys=True),
+                     status, note, actor, now),
+                )
+                advisory_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("建议版本冲突，请刷新后重试") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM advisories WHERE id=?", (advisory_id,)).fetchone()
+        return self._advisory(row)
+
+    def supersede_advisory(self, advisory_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE advisories SET status='superseded' WHERE id=?", (advisory_id,))
+
+    def update_signoff(self, advisory_id: int, party: str, decision: str,
+                       comment: Optional[str], actor: str,
+                       status: str) -> Dict[str, Any]:
+        if party not in ("eng", "road"):
+            raise ValidationError("未知会签方")
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                f"""UPDATE advisories SET {party}_decision=?, {party}_by=?,
+                    {party}_comment=?, {party}_at=?, status=?
+                    WHERE id=? AND status IN ('signing','pending_dispute')""",
+                (decision, actor, comment, now, status, advisory_id),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("当前版本不可会签")
+            row = self.conn.execute(
+                "SELECT * FROM advisories WHERE id=?", (advisory_id,)).fetchone()
+        return self._advisory(row)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

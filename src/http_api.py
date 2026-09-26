@@ -76,28 +76,36 @@ def make_handler(service: Service, static_dir: str):
         def do_GET(self) -> None:
             try:
                 path = urlparse(self.path).path
+                seg = [part for part in path.split("/") if part]
                 if path == "/health":
                     self._json(200, {"status": "ok"})
                 elif path == "/":
                     self._html(root / "index.html")
-                elif path == "/api/items":
+                elif seg == ["api", "items"]:
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    actor, role = self._identity()
-                    del actor
-                    self._json(200, {"records": service.list_records(item_id, role)})
-                elif path.startswith("/api/items/"):
-                    item_id = int(path.rsplit("/", 1)[-1])
-                    actor, role = self._identity()
-                    del actor
-                    self._json(200, service.get_item(item_id, role))
-                elif path == "/api/audit":
+                elif seg == ["api", "audit"]:
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif len(seg) >= 3 and seg[:2] == ["api", "items"]:
+                    item_id = int(seg[2])
+                    rest = seg[3:]
+                    actor, role = self._identity()
+                    del actor
+                    if not rest:
+                        self._json(200, service.get_item(item_id, role))
+                    elif rest == ["records"]:
+                        self._json(200, {"records": service.list_records(item_id, role)})
+                    elif rest == ["readings"]:
+                        self._json(200, {"readings": service.list_readings(item_id, role)})
+                    elif rest == ["advisory"]:
+                        self._json(200, service.current_advisory(item_id, role))
+                    elif rest == ["advisories"]:
+                        self._json(200, {"advisories": service.list_advisories(item_id, role)})
+                    else:
+                        self._json(404, {"error": "not_found"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -106,19 +114,35 @@ def make_handler(service: Service, static_dir: str):
         def do_POST(self) -> None:
             try:
                 path = urlparse(self.path).path
+                seg = [part for part in path.split("/") if part]
                 actor, role = self._identity()
                 body = self._body()
-                if path == "/api/items":
+                if seg == ["api", "items"]:
                     self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    self._json(201, service.add_record(item_id, body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
-                    target = body.get("target")
-                    expected = body.get("expected_version")
-                    self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                elif len(seg) >= 3 and seg[:2] == ["api", "items"]:
+                    item_id = int(seg[2])
+                    rest = seg[3:]
+                    if rest == ["records"]:
+                        self._json(201, service.add_record(item_id, body, actor, role))
+                    elif rest == ["transition"]:
+                        target = body.get("target")
+                        expected = body.get("expected_version")
+                        self._json(200, service.transition(
+                            item_id, target, expected, actor, role))
+                    elif rest == ["readings"]:
+                        self._json(201, service.register_reading(item_id, body, actor, role))
+                    elif len(rest) == 3 and rest[0] == "readings" and rest[2] == "review":
+                        self._json(200, service.review_reading(
+                            item_id, int(rest[1]), body, actor, role))
+                    elif len(rest) == 3 and rest[0] == "readings" and rest[2] == "close":
+                        self._json(200, service.close_defect(
+                            item_id, int(rest[1]), actor, role))
+                    elif rest == ["advisory", "sign"]:
+                        self._json(200, service.sign_advisory(item_id, body, actor, role))
+                    elif rest == ["advisory", "restore"]:
+                        self._json(200, service.restore(item_id, body, actor, role))
+                    else:
+                        self._json(404, {"error": "not_found"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
